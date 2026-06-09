@@ -692,9 +692,12 @@ def _get_cached_redirect_uri(storage: "FileTokenStorage") -> str | None:
 
 
 def _port_available(host: str, port: int) -> bool:
-    """Check whether *port* is free on *host*."""
-    import socket
+    """Check whether *port* is free on *host*.
 
+    Note: this is a best-effort probe — a TOCTOU race exists where another
+    process could bind the port between this check and the caller's use.
+    Callers must handle bind failures gracefully.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind((host, port))
@@ -907,7 +910,7 @@ def build_oauth_provider(
         server = HTTPServer((callback_host, port), _CallbackHandler)
 
     async def redirect_handler(auth_url: str) -> None:
-        print(f"Opening browser for authorization...", file=sys.stderr)
+        print("Opening browser for authorization...", file=sys.stderr)
         print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
         webbrowser.open(auth_url)
 
