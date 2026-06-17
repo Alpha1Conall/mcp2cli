@@ -299,6 +299,137 @@ class TestRobustOAuthClientProvider:
 
         anyio.run(_drive)
 
+    def test_refresh_preserves_refresh_token_when_omitted(self, tmp_path, monkeypatch):
+        """Issue #58: a successful refresh whose response omits refresh_token
+        must carry the previously cached refresh token forward (RFC 6749
+        §5.1) and re-persist it, so subsequent refreshes still work."""
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _setup():
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="old-access",
+                    token_type="Bearer",
+                    refresh_token="keep-me",
+                    expires_in=3600,
+                )
+            )
+
+        anyio.run(_setup)
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19884/callback",
+        )
+
+        # Refresh response that rotates the access token but omits refresh_token
+        class _FakeResponse:
+            status_code = 200
+            async def aread(self):
+                return b'{"access_token":"new-access","token_type":"Bearer","expires_in":3600}'
+
+        async def _drive():
+            await provider._initialize()
+            ok = await provider._handle_refresh_response(_FakeResponse())
+            assert ok is True
+            # Old refresh token carried forward in memory …
+            assert provider.context.current_tokens.access_token == "new-access"
+            assert provider.context.current_tokens.refresh_token == "keep-me"
+            # … and persisted to disk for the next process.
+            persisted = await storage.get_tokens()
+            assert persisted.refresh_token == "keep-me"
+
+        anyio.run(_drive)
+
+    def test_refresh_uses_new_refresh_token_when_present(self, tmp_path, monkeypatch):
+        """When the server DOES issue a new refresh token, it replaces the
+        old one (the old token must be discarded per RFC 6749 §5.1)."""
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _setup():
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="old-access",
+                    token_type="Bearer",
+                    refresh_token="old-refresh",
+                    expires_in=3600,
+                )
+            )
+
+        anyio.run(_setup)
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19885/callback",
+        )
+
+        class _FakeResponse:
+            status_code = 200
+            async def aread(self):
+                return (
+                    b'{"access_token":"new-access","token_type":"Bearer",'
+                    b'"refresh_token":"new-refresh","expires_in":3600}'
+                )
+
+        async def _drive():
+            await provider._initialize()
+            ok = await provider._handle_refresh_response(_FakeResponse())
+            assert ok is True
+            assert provider.context.current_tokens.refresh_token == "new-refresh"
+
+        anyio.run(_drive)
+
+
+class TestRobustClientCredentialsProvider:
+    """Behavior of the client-credentials provider subclass (issue #57)."""
+
+    def test_initialize_restores_token_expiry_from_sidecar(self, tmp_path, monkeypatch):
+        """A fresh process using the client-credentials flow restores the
+        persisted expiry, so an expired access token fails is_token_valid()
+        and re-auth happens proactively instead of after a wasted 401."""
+        import time
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _setup():
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="stale",
+                    token_type="Bearer",
+                    expires_in=3600,
+                )
+            )
+            storage._tokens_meta_path.write_text(
+                json.dumps({"expires_at": time.time() - 60})
+            )
+
+        anyio.run(_setup)
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            client_id="my-id",
+            client_secret="my-secret",
+        )
+
+        async def _drive():
+            await provider._initialize()
+            assert provider.context.token_expiry_time is not None
+            assert provider.context.token_expiry_time < time.time()
+            assert not provider.context.is_token_valid()
+
+        anyio.run(_drive)
+
 
 class TestBuildOAuthProvider:
     """Tests for build_oauth_provider factory."""

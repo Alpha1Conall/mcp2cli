@@ -705,6 +705,25 @@ def _port_available(host: str, port: int) -> bool:
     except OSError:
         return False
 
+
+def _restore_token_expiry_from_sidecar(context) -> None:
+    """Recompute ``token_expiry_time`` from the persisted ``expires_at`` sidecar.
+
+    The upstream SDK's ``_initialize`` reloads ``current_tokens`` from disk but
+    never restores ``token_expiry_time`` — the persisted ``OAuthToken`` only
+    carries the relative ``expires_in``. Without this, ``is_token_valid()``
+    treats an already-expired access token as valid on a fresh process and
+    sends a stale Bearer, wasting a 401 round-trip before re-auth (issues #50
+    and #57). Shared by the authorization-code and client-credentials
+    providers.
+    """
+    storage = context.storage
+    if isinstance(storage, FileTokenStorage) and context.current_tokens:
+        expires_at = storage.get_expires_at()
+        if expires_at is not None:
+            context.token_expiry_time = expires_at
+
+
 def build_oauth_provider(
     server_url: str,
     *,
@@ -745,7 +764,22 @@ def build_oauth_provider(
             ClientCredentialsOAuthProvider,
         )
 
-        return ClientCredentialsOAuthProvider(
+        class _RobustClientCredentialsProvider(ClientCredentialsOAuthProvider):
+            """Client-credentials provider that restores expiry across restarts.
+
+            Issue #57: the upstream ``_initialize`` reloads tokens from disk
+            without recomputing ``token_expiry_time``, so an expired access
+            token looks valid after a process restart and a stale Bearer is
+            sent — triggering a 401 before the provider re-authenticates.
+            Restore the expiry from the sidecar so expired tokens are detected
+            proactively.
+            """
+
+            async def _initialize(self) -> None:
+                await super()._initialize()
+                _restore_token_expiry_from_sidecar(self.context)
+
+        return _RobustClientCredentialsProvider(
             server_url=server_url,
             storage=storage,
             client_id=client_id,
@@ -783,13 +817,19 @@ def build_oauth_provider(
 
         async def _initialize(self) -> None:
             await super()._initialize()
-            storage = self.context.storage
-            if isinstance(storage, FileTokenStorage) and self.context.current_tokens:
-                expires_at = storage.get_expires_at()
-                if expires_at is not None:
-                    self.context.token_expiry_time = expires_at
+            _restore_token_expiry_from_sidecar(self.context)
 
         async def _handle_refresh_response(self, response) -> bool:
+            # Issue #58: RFC 6749 §5.1 permits a refresh response to omit
+            # refresh_token, in which case the previously issued one stays
+            # valid. The upstream SDK replaces current_tokens wholesale, so
+            # refresh_token becomes None and every later refresh fails for
+            # the lack of one. Remember the old token to carry it forward.
+            old_refresh_token = (
+                self.context.current_tokens.refresh_token
+                if self.context.current_tokens
+                else None
+            )
             ok = await super()._handle_refresh_response(response)
             if not ok:
                 # Refresh failed. The cached DCR client_id may have been
@@ -801,6 +841,16 @@ def build_oauth_provider(
                 if isinstance(storage, FileTokenStorage):
                     storage.clear_client_info()
                     storage.clear_tokens()
+                return ok
+            # Carry the prior refresh token forward when the server did not
+            # issue a new one, then re-persist so it survives a restart.
+            tokens = self.context.current_tokens
+            if tokens is not None and not tokens.refresh_token and old_refresh_token:
+                tokens = tokens.model_copy(update={"refresh_token": old_refresh_token})
+                self.context.current_tokens = tokens
+                storage = self.context.storage
+                if isinstance(storage, FileTokenStorage):
+                    await storage.set_tokens(tokens)
             return ok
 
     _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
